@@ -47,6 +47,7 @@ DELETE FROM public.user_roles
 WHERE role = 'admin'
   AND user_id <> 'fa46e527-a483-40f1-9060-ced27a4512a0';
 
-INSERT INTO public.user_roles (user_id, role)
-VALUES ('fa46e527-a483-40f1-9060-ced27a4512a0', 'admin')
-ON CONFLICT (user_id, role) DO NOTHING;
+-- Note: Admin role assignment removed - will be handled through application
+-- INSERT INTO public.user_roles (user_id, role)
+-- VALUES ('fa46e527-a483-40f1-9060-ced27a4512a0', 'admin')
+-- ON CONFLICT (user_id, role) DO NOTHING;

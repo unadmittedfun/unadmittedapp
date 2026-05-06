@@ -7,13 +7,13 @@ CREATE TABLE IF NOT EXISTS public.security_logs (
     ip_address INET,
     user_agent TEXT,
     session_id TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-
-    -- Indexes for performance
-    INDEX idx_security_logs_user_id (user_id),
-    INDEX idx_security_logs_event_type (event_type),
-    INDEX idx_security_logs_created_at (created_at DESC)
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- Indexes for performance
+CREATE INDEX IF NOT EXISTS idx_security_logs_user_id ON public.security_logs(user_id);
+CREATE INDEX IF NOT EXISTS idx_security_logs_event_type ON public.security_logs(event_type);
+CREATE INDEX IF NOT EXISTS idx_security_logs_created_at ON public.security_logs(created_at DESC);
 
 -- Enable RLS
 ALTER TABLE public.security_logs ENABLE ROW LEVEL SECURITY;
