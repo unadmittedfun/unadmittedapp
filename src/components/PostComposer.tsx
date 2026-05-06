@@ -1,0 +1,154 @@
+import { useEffect, useRef, useState } from "react";
+import { supabase } from "@/integrations/supabase/client";
+import { useAuth } from "@/contexts/AuthContext";
+import { postSchema, containsSurname, looksLikeAd, countWords, POST_MAX_WORDS } from "@/lib/validation";
+import { Card } from "@/components/ui/card";
+import { Textarea } from "@/components/ui/textarea";
+import { Button } from "@/components/ui/button";
+import { toast } from "sonner";
+import { AlertTriangle, ImagePlus, X } from "lucide-react";
+
+const MAX_BYTES = 10 * 1024 * 1024;
+const ALLOWED = ["image/jpeg","image/png","image/webp","image/gif","video/mp4","video/webm","video/quicktime"];
+
+export const PostComposer = ({ onPosted }: { onPosted: () => void }) => {
+  const { user, profile } = useAuth();
+  const [body, setBody] = useState("");
+  const [posting, setPosting] = useState(false);
+  const [file, setFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  // Pre-fill from a "spark" prompt picked on the welcome screen.
+  useEffect(() => {
+    const draft = sessionStorage.getItem("unadmitted:draft");
+    if (draft) {
+      setBody(draft);
+      sessionStorage.removeItem("unadmitted:draft");
+    }
+  }, []);
+
+
+  const pickFile = (f: File | null) => {
+    if (!f) return;
+    if (!ALLOWED.includes(f.type)) return toast.error("Only images, GIFs and videos are supported");
+    if (f.size > MAX_BYTES) return toast.error("File too large — 10 MB max");
+    setFile(f);
+    setPreviewUrl(URL.createObjectURL(f));
+  };
+
+  const clearFile = () => {
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    setFile(null);
+    setPreviewUrl(null);
+    if (fileRef.current) fileRef.current.value = "";
+  };
+
+  const submit = async () => {
+    const parsed = postSchema.safeParse({ body: body || (file ? "📎" : "") });
+    if (!parsed.success) return toast.error(parsed.error.errors[0].message);
+    // anon_vvv is exempt from amendment checks (admin/free-speech account).
+    const isExempt = profile?.handle === "anon_vvv";
+    if (!isExempt && containsSurname(parsed.data.body)) {
+      return toast.error("1st Amendment: no name drops with surnames.");
+    }
+    if (!isExempt && looksLikeAd(parsed.data.body)) {
+      return toast.error("2nd Amendment: chat with the Marketing Bot to promote.");
+    }
+    if (!user || !profile) return;
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) {
+      toast.error("your session expired — please sign in again");
+      await supabase.auth.signOut();
+      window.location.href = "/auth";
+      return;
+    }
+    setPosting(true);
+    try {
+      let media_url: string | null = null;
+      let media_type: "image" | "video" | null = null;
+      if (file) {
+        const ext = file.name.split(".").pop() ?? "bin";
+        const path = `${user.id}/${crypto.randomUUID()}.${ext}`;
+        const { error: upErr } = await supabase.storage
+          .from("post-media").upload(path, file, { contentType: file.type, upsert: false });
+        if (upErr) throw upErr;
+        media_url = supabase.storage.from("post-media").getPublicUrl(path).data.publicUrl;
+        media_type = file.type.startsWith("video/") ? "video" : "image";
+      }
+      const { error } = await supabase.from("posts").insert({
+        author_id: user.id,
+        body: parsed.data.body,
+        media_url: media_url ?? undefined,
+        media_type: media_type ?? undefined,
+        community_id: profile.community_id,
+      });
+      if (error) throw error;
+      setBody("");
+      clearFile();
+      onPosted();
+    } catch (e: any) {
+      toast.error(e.message ?? "Failed to post");
+    } finally {
+      setPosting(false);
+    }
+  };
+
+  return (
+    <Card className="p-3 lg:p-4 mb-3 lg:mb-4 shadow-card">
+      <div className="text-[10px] lg:text-xs text-muted-foreground mb-1 lg:mb-2">
+        posting as <span className="font-mono text-foreground">anonymous</span>
+      </div>
+      <Textarea
+        value={body}
+        onChange={(e) => setBody(e.target.value)}
+        placeholder="do you have anything unadmitted in mind?"
+        className="min-h-[56px] lg:min-h-[90px] resize-none border-0 focus-visible:ring-0 pl-3 lg:pl-4 pr-0 text-xs lg:text-sm placeholder:text-xs lg:placeholder:text-sm"
+      />
+      {previewUrl && file && (
+        <div className="relative inline-block rounded-lg overflow-hidden border border-border mt-2">
+          {file.type.startsWith("video/") ? (
+            <video src={previewUrl} className="max-h-64" controls />
+          ) : (
+            <img src={previewUrl} alt="preview" className="max-h-64" />
+          )}
+          <button
+            onClick={clearFile}
+            className="absolute top-1.5 right-1.5 h-7 w-7 rounded-full bg-foreground/70 text-background flex items-center justify-center hover:bg-foreground"
+            aria-label="Remove media"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+      <input
+        ref={fileRef}
+        type="file"
+        accept={ALLOWED.join(",")}
+        className="hidden"
+        onChange={(e) => pickFile(e.target.files?.[0] ?? null)}
+      />
+      <div className="flex items-center justify-between pt-1.5 lg:pt-2 border-t border-border mt-2 lg:mt-3">
+        <div className="flex items-center gap-2">
+          <Button
+            type="button" variant="ghost" size="sm"
+            className="text-primary gap-1.5"
+            onClick={() => fileRef.current?.click()}
+          >
+            <ImagePlus className="h-4 w-4" />
+            <span className="text-xs font-semibold">media</span>
+          </Button>
+          <span className="hidden sm:inline-flex items-center gap-1 text-[11px] text-muted-foreground">
+            <AlertTriangle className="h-3 w-3" /> no surnames · no store ads · max 10 mb
+          </span>
+        </div>
+        <div className="flex items-center gap-3">
+          <span className={`text-xs ${countWords(body) > POST_MAX_WORDS ? "text-destructive" : "text-muted-foreground"}`}>{countWords(body)}/{POST_MAX_WORDS} words</span>
+          <Button onClick={submit} disabled={posting || (!body.trim() && !file)} size="sm">
+            {posting ? "…" : "post"}
+          </Button>
+        </div>
+      </div>
+    </Card>
+  );
+};
