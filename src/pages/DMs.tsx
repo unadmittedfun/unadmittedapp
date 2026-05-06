@@ -2,27 +2,32 @@ import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
+import { useEncryption } from "@/contexts/EncryptionContext";
 import { AppShell } from "@/components/AppShell";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
 import { containsSurname } from "@/lib/validation";
+import { securityMiddleware } from "@/lib/security";
 import { toast } from "sonner";
 import { formatDistanceToNow } from "date-fns";
-import { MessageSquare, Send, ArrowLeft } from "lucide-react";
+import { MessageSquare, Send, ArrowLeft, Shield, ShieldCheck } from "lucide-react";
 
 type Conv = { id: string; user_a: string; user_b: string; is_marketing_bot: boolean; other_handle: string; other_avatar?: string | null; last_message?: string; last_timestamp?: string };
-type Msg = { id: string; body: string; sender_id: string | null; is_bot: boolean; created_at: string };
+type Msg = { id: string; body: string; sender_id: string | null; is_bot: boolean; created_at: string; is_encrypted?: boolean };
 
 const DMs = () => {
   const { user, profile } = useAuth();
+  const { encryptMessage, decryptMessage, isLoading: encryptionLoading } = useEncryption();
   const [searchParams, setSearchParams] = useSearchParams();
   const [convs, setConvs] = useState<Conv[]>([]);
   const [active, setActive] = useState<Conv | null>(null);
   const [messages, setMessages] = useState<Msg[]>([]);
+  const [decryptedMessages, setDecryptedMessages] = useState<Map<string, string>>(new Map());
   const [body, setBody] = useState("");
   const [otherUserProfile, setOtherUserProfile] = useState<any>(null);
+  const [isSending, setIsSending] = useState(false);
 
   const loadConvs = async () => {
     if (!user) return;
@@ -59,7 +64,30 @@ const DMs = () => {
 
   const loadMessages = async (cid: string) => {
     const { data } = await supabase.from("messages").select("*").eq("conversation_id", cid).order("created_at");
-    setMessages((data ?? []) as Msg[]);
+    const msgs = (data ?? []) as Msg[];
+
+    // Decrypt messages that aren't from bots
+    const decryptionPromises = msgs
+      .filter(msg => !msg.is_bot && msg.sender_id !== user?.id)
+      .map(async (msg) => {
+        try {
+          const decrypted = await decryptMessage(msg.body, msg.sender_id!);
+          return { id: msg.id, content: decrypted };
+        } catch (error) {
+          console.error('Failed to decrypt message:', error);
+          return { id: msg.id, content: '[Encrypted message - decryption failed]' };
+        }
+      });
+
+    const decryptedResults = await Promise.all(decryptionPromises);
+    const newDecryptedMessages = new Map(decryptedMessages);
+
+    decryptedResults.forEach(({ id, content }) => {
+      newDecryptedMessages.set(id, content);
+    });
+
+    setDecryptedMessages(newDecryptedMessages);
+    setMessages(msgs);
   };
 
   useEffect(() => { loadConvs(); }, [user, searchParams]);
@@ -96,13 +124,55 @@ const DMs = () => {
   }, [active, user, convs]);
 
   const send = async () => {
-    if (!user || !profile || !active || !body.trim()) return;
+    if (!user || !profile || !active || !body.trim() || isSending) return;
+
+    // Security validation
+    const validation = securityMiddleware.validateRequest({ body: body.trim() });
+    if (!validation.isValid) {
+      toast.error(validation.errors.join(', '));
+      return;
+    }
+
+    // Rate limiting
+    if (!securityMiddleware.checkUserRateLimit(user.id, 'send_message', 30)) {
+      toast.error('Too many messages. Please wait before sending another.');
+      return;
+    }
+
     if (containsSurname(body)) return toast.error("1st amendment: no surnames.");
-    const { error } = await supabase.from("messages").insert({
-      conversation_id: active.id, sender_id: user.id, body: body.trim(), community_id: profile.community_id,
-    });
-    if (error) return toast.error(error.message);
-    setBody("");
+
+    setIsSending(true);
+    try {
+      let messageBody = validation.sanitized.body;
+
+      // Encrypt message for the recipient (if not a bot conversation)
+      if (!active.is_marketing_bot) {
+        const recipientId = active.user_a === user.id ? active.user_b : active.user_a;
+        messageBody = await encryptMessage(messageBody, recipientId);
+      }
+
+      const { error } = await supabase.from("messages").insert({
+        conversation_id: active.id,
+        sender_id: user.id,
+        body: messageBody,
+        community_id: profile.community_id,
+        is_encrypted: !active.is_marketing_bot,
+      });
+
+      if (error) {
+        console.error('Failed to send message:', error);
+        securityMiddleware.logSecurityEvent('message_send_failed', user.id, { error: error.message });
+        return toast.error('Failed to send message');
+      }
+
+      setBody("");
+      securityMiddleware.logSecurityEvent('message_sent', user.id, { conversationId: active.id });
+    } catch (error) {
+      console.error('Error sending message:', error);
+      toast.error('Failed to send message');
+    } finally {
+      setIsSending(false);
+    }
   };
 
   if (active) {
@@ -116,15 +186,30 @@ const DMs = () => {
             <AvatarImage key={active.other_avatar} src={active.other_avatar ?? undefined} />
             <AvatarFallback>AN</AvatarFallback>
           </Avatar>
-          <p className="font-semibold">{active.other_handle}</p>
+          <div className="flex-1">
+            <p className="font-semibold">{active.other_handle}</p>
+            <div className="flex items-center gap-1 text-xs text-muted-foreground">
+              <Shield className="h-3 w-3" />
+              <span>{active.is_marketing_bot ? 'Unencrypted' : 'End-to-end encrypted'}</span>
+            </div>
+          </div>
         </Card>
         <div className="space-y-2 mb-4 min-h-[40vh]">
           {messages.map((m) => {
             const mine = m.sender_id === user?.id;
+            const displayBody = mine
+              ? (m.is_encrypted ? '[Encrypted message sent]' : m.body)
+              : (m.is_encrypted ? (decryptedMessages.get(m.id) || '[Decrypting...]') : m.body);
+
             return (
               <div key={m.id} className={`flex ${mine ? "justify-end" : "justify-start"}`}>
                 <div className={`max-w-[75%] px-3 py-2 rounded-2xl text-sm ${mine ? "bg-primary text-primary-foreground" : "bg-secondary"}`}>
-                  <p className="whitespace-pre-wrap">{m.body}</p>
+                  <div className="flex items-center gap-1 mb-1">
+                    {m.is_encrypted && (
+                      <ShieldCheck className="h-3 w-3 text-green-500" />
+                    )}
+                    <p className="whitespace-pre-wrap">{displayBody}</p>
+                  </div>
                   <p className={`text-[10px] mt-1 ${mine ? "text-primary-foreground/70" : "text-muted-foreground"}`}>
                     {formatDistanceToNow(new Date(m.created_at), { addSuffix: true })}
                   </p>
@@ -134,8 +219,28 @@ const DMs = () => {
           })}
         </div>
         <div className="sticky bottom-2 flex gap-2">
-          <Input value={body} onChange={(e) => setBody(e.target.value)} placeholder="message…" onKeyDown={(e) => e.key === "Enter" && send()} />
-          <Button onClick={send} size="icon"><Send className="h-4 w-4" /></Button>
+          <div className="flex-1">
+            <Input
+              value={body}
+              onChange={(e) => setBody(e.target.value)}
+              placeholder={encryptionLoading ? "Setting up encryption..." : "message…"}
+              onKeyDown={(e) => e.key === "Enter" && !isSending && send()}
+              disabled={encryptionLoading || isSending}
+            />
+            {!active?.is_marketing_bot && (
+              <div className="flex items-center gap-1 mt-1 text-xs text-muted-foreground">
+                <ShieldCheck className="h-3 w-3 text-green-500" />
+                <span>Messages are encrypted</span>
+              </div>
+            )}
+          </div>
+          <Button
+            onClick={send}
+            size="icon"
+            disabled={encryptionLoading || isSending || !body.trim()}
+          >
+            <Send className="h-4 w-4" />
+          </Button>
         </div>
       </AppShell>
     );

@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useState, ReactNode } from "react";
 import { Session, User } from "@supabase/supabase-js";
 import { supabase } from "@/integrations/supabase/client";
+import { securityMiddleware } from "@/lib/security";
 import {
   Community,
   applyCommunityTheme,
@@ -97,8 +98,13 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       setSession(s);
       setUser(s?.user ?? null);
       if (s?.user) {
+        securityMiddleware.logSecurityEvent('user_login', s.user.id, {
+          email: s.user.email,
+          provider: s.user.app_metadata?.provider,
+        });
         setTimeout(() => loadProfile(s.user.id), 0);
       } else {
+        securityMiddleware.logSecurityEvent('user_logout');
         setProfile(null);
         setCommunity(null);
         applyCommunityTheme(hostCommunity);
@@ -119,6 +125,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   };
 
   const signOut = async () => {
+    securityMiddleware.logSecurityEvent('user_logout_initiated', user?.id);
     await supabase.auth.signOut();
   };
 
